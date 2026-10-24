@@ -1,0 +1,87 @@
+import streamlit as st
+import requests
+import google.generativeai as genai
+import json
+import pandas as pd
+from PIL import Image
+import io
+
+st.set_page_config(page_title="محلل الفواتير الذكي", page_icon="🧾", layout="centered")
+st.title("🧾 محلل الفواتير الذكي")
+st.caption("ارفع صورة الفاتورة (عربي / إنجليزي) وحولها لجدول Excel في ثواني")
+
+# --- الإعدادات ---
+GEMINI_KEY = st.secrets.get("GEMINI_KEY", "")
+OCR_KEY = st.secrets.get("OCR_KEY", "")
+
+if not GEMINI_KEY:
+    st.warning("أضف مفتاح GEMINI_KEY في الـ Secrets عند النشر")
+    GEMINI_KEY = st.text_input("ضع مفتاح Gemini مؤقتاً للتجربة", type="password")
+
+genai.configure(api_key=GEMINI_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+uploaded = st.file_uploader("ارفع الفاتورة", type=["jpg","jpeg","png","pdf"])
+
+if uploaded:
+    st.image(uploaded, caption="الفاتورة المرفوعة", use_column_width=True)
+    
+    with st.spinner("جاري قراءة الفاتورة..."):
+        # 1. OCR مع دعم عربي + انجليزي
+        files = {"file": uploaded.getvalue()}
+        data = {"apikey": OCR_KEY, "language": "ara+eng", "isOverlayRequired": False, "OCREngine": 2}
+        res = requests.post("https://api.ocr.space/parse/image", files=files, data=data)
+        parsed = res.json()
+        
+        if parsed.get("IsErroredOnProcessing"):
+            st.error(f"خطأ في القراءة: {parsed.get('ErrorMessage')}")
+            st.stop()
+            
+        text = parsed["ParsedResults"][0]["ParsedText"]
+
+        # 2. Gemini لتنظيم البيانات
+        prompt = f"""
+        أنت خبير محاسبة. استخرج من نص الفاتورة التالي JSON صالح فقط بدون أي شرح إضافي.
+        الصيغة المطلوبة:
+        {{
+          "vendor": "اسم المورد",
+          "date": "YYYY-MM-DD",
+          "invoice_number": "رقم الفاتورة",
+          "total": 0,
+          "currency": "SAR / USD...",
+          "items": [ {{"name": "اسم المنتج", "qty": 1, "unit_price": 0, "line_total": 0}} ]
+        }}
+        إذا لم تجد حقل اتركه فارغ. الأرقام يجب أن تكون أرقام فقط.
+        النص:
+        {text}
+        """
+        
+        ai_res = model.generate_content(prompt)
+        clean_json = ai_res.text.replace("```json","").replace("```","").strip()
+        invoice_data = json.loads(clean_json)
+
+    st.success("تم التحليل بنجاح!")
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("المورد", invoice_data.get("vendor","-"))
+    c2.metric("رقم الفاتورة", invoice_data.get("invoice_number","-"))
+    c3.metric("الإجمالي", f"{invoice_data.get('total',0)} {invoice_data.get('currency','')}")
+
+    # جدول قابل للتعديل
+    df = pd.DataFrame(invoice_data.get("items", []))
+    edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+
+    # تصدير Excel
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        edited_df.to_excel(writer, index=False, sheet_name='Items')
+        pd.DataFrame([invoice_data]).to_excel(writer, index=False, sheet_name='Summary')
+    
+    st.download_button(
+        label="📥 تحميل كـ Excel",
+        data=output.getvalue(),
+        file_name=f"invoice_{invoice_data.get('invoice_number','')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    with st.expander("عرض النص الخام المقروء"):
+        st.text(text)
